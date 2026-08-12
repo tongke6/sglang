@@ -835,6 +835,10 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Opt in to value-exact TopK v2 selection when the fp16 coarse threshold bin
+    # contains more candidates than its 2048-entry fast-path buffer. Disabled by
+    # default to preserve the legacy truncating behavior.
+    SGLANG_TOPK_V2_EXACT = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

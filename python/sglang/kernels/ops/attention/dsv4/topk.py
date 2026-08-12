@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 
 from .utils import make_name
 
@@ -94,6 +95,7 @@ def topk_transform_512_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    exact: Optional[bool] = None,
 ) -> None:
     """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -105,8 +107,15 @@ def topk_transform_512_v2(
     (GLM 5.2 MTP DP-idle companion rows hit exactly this). A length of 0 is
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
+
+    ``exact`` controls the dense-threshold-bin overflow path. It defaults to
+    ``SGLANG_TOPK_V2_EXACT`` (disabled): when enabled, overflowing bins are
+    refined with fp32 radix passes instead of being truncated to the 2048-entry
+    candidate buffer.
     """
     module = _jit_topk_v2_module()
+    if exact is None:
+        exact = envs.SGLANG_TOPK_V2_EXACT.get()
     module.topk_transform(
         scores,
         seq_lens,
@@ -115,4 +124,5 @@ def topk_transform_512_v2(
         page_size,
         metadata,
         out_raw_indices,
+        exact,
     )

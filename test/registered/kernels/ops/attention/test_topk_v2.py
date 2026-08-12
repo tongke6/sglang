@@ -24,12 +24,16 @@ included explicitly, across k in {512,1024,2048} and identity/perm page tables.
 
 from __future__ import annotations
 
+import os
 import sys
+from unittest import mock
 
 import pytest
 import torch
 
+import sglang.kernels.ops.attention.dsv4.topk as topk_module
 from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2, topk_transform_512_v2
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -62,8 +66,8 @@ FIXED_CONFIGS = [
     (100, 65536),
     # --- Cluster, fused small-batch kernel (batch <= 30, max_seq > floor) ---
     (1, 65537),  # single row just over floor
-    (2, 131072),
-    (8, 98304),
+    (15, 98304),  # occupancy-1 specialization upper boundary
+    (16, 98304),  # occupancy-2 specialization lower boundary
     (30, 131072),  # batch == pool boundary
     # --- Cluster, persistent pool + main kernel (30 < batch <= 128) ---
     (31, 131072),  # just over small-batch
@@ -74,6 +78,25 @@ FIXED_CONFIGS = [
     (129, 131072),
     (200, 262144),
 ]
+
+
+def test_topk_v2_exact_switch_defaults_disabled() -> None:
+    with mock.patch.dict(os.environ):
+        os.environ.pop("SGLANG_TOPK_V2_EXACT", None)
+        assert envs.SGLANG_TOPK_V2_EXACT.get() is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_topk_v2_exact_switch_is_forwarded(enabled: bool) -> None:
+    module = mock.Mock()
+    tensor = torch.empty(0)
+    with (
+        mock.patch.object(topk_module, "_jit_topk_v2_module", return_value=module),
+        envs.SGLANG_TOPK_V2_EXACT.override(enabled),
+    ):
+        topk_transform_512_v2(tensor, tensor, tensor, tensor, PAGE_SIZE, tensor)
+
+    assert module.topk_transform.call_args.args[-1] is enabled
 
 
 def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
@@ -293,6 +316,84 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, page_table, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (1, 4096),  # register path
+        (1, 32768),  # streaming path
+        (1, 65537),  # small-batch cluster path
+        (31, 131072),  # persistent-cluster path (planner threshold is 98,304)
+    ],
+)
+@pytest.mark.parametrize("k", [512, 2048])
+@torch.inference_mode()
+def test_topk_v2_dense_threshold_bin_is_exact(batch: int, seq: int, k: int) -> None:
+    """More than 2048 candidates in one coarse bin must not be truncated."""
+    device = "cuda"
+    width = (seq + 3) & ~3
+    # The whole valid row remains in one fp16-derived coarse bin, while the
+    # fp32 values are distinct and increase with the index.
+    row = 1.0 + torch.arange(width, device=device, dtype=torch.float32) * 2.0e-7
+    scores = row.view(1, -1).expand(batch, -1).contiguous()
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(batch, num_pages, "identity", device)
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=device)
+    raw = torch.full_like(out, -1)
+    metadata = plan_topk_v2(seq_lens)
+
+    topk_transform_512_v2(
+        scores,
+        seq_lens,
+        page_table,
+        out,
+        PAGE_SIZE,
+        metadata,
+        raw,
+        exact=True,
+    )
+    actual = torch.gather(scores, 1, raw.to(torch.int64)).sort(dim=-1).values
+    expected = (
+        torch.topk(scores[:, :seq], k, dim=-1, sorted=False).values.sort(dim=-1).values
+    )
+    assert torch.equal(actual, expected)
+
+
+@torch.inference_mode()
+def test_topk_v2_cluster_overflow_after_topk_is_filled() -> None:
+    """Do not enter exact tie selection when strictly-above values fill top-k."""
+    device = "cuda"
+    seq, k = 65537, 2048
+    width = (seq + 3) & ~3
+    scores = torch.zeros((1, width), dtype=torch.float32, device=device)
+    # +inf and huge finite values share the fp16 inf coarse bin. The collect
+    # boundaries classify the infinities as strictly above, so they fill top-k,
+    # while the finite values make the same coarse bin overflow its tie buffer.
+    scores[0, :3000] = float("inf")
+    scores[0, 3000:9000] = 1.0e30
+    seq_lens = torch.tensor([seq], dtype=torch.int32, device=device)
+    page_table, _ = _make_page_table(
+        1, (seq + PAGE_SIZE - 1) // PAGE_SIZE, "identity", device
+    )
+    out = torch.full((1, k), -1, dtype=torch.int32, device=device)
+    raw = torch.full_like(out, -1)
+
+    topk_transform_512_v2(
+        scores,
+        seq_lens,
+        page_table,
+        out,
+        PAGE_SIZE,
+        plan_topk_v2(seq_lens),
+        raw,
+        exact=True,
+    )
+    torch.cuda.synchronize()
+
+    assert ((raw >= 0) & (raw < seq)).all()
+    assert torch.isinf(torch.gather(scores, 1, raw.to(torch.int64))).all()
 
 
 if __name__ == "__main__":

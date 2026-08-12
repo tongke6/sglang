@@ -39,13 +39,15 @@ constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
 constexpr uint32_t kClusterSize = Cluster::kClusterSize;
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
+constexpr uint32_t kExactWorkspaceBytes = impl::TopKConfig::kLargeTieWorkspaceBytes;
 
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 
 constexpr uint32_t kClusterFloor = 65536;
 constexpr uint32_t kClusterMaxBatch = 512;
-constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
+constexpr uint32_t kClustersPerOccupancyWave = 15;
+constexpr uint32_t kNumPersistentClusters = kClustersPerOccupancyWave * kOccupancy;
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -71,6 +73,7 @@ struct TopKLaunchParams {
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
+  bool exact_ties;         // re-scan overflowing coarse bins instead of truncating them
 
   SGL_DEVICE const GlobalMetadata& global() const {
     return *reinterpret_cast<const GlobalMetadata*>(metadata);
@@ -94,6 +97,7 @@ struct TopKLaunchParams {
         .topk = topk,
         .seq_len = seq_len,
         .page_bits = page_bits,
+        .exact_ties = exact_ties,
     };
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
@@ -117,7 +121,10 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
     const auto it = params.item(w);
     const auto problem = params.problem(it.batch_id, it.seq_len);
     Cluster::forward<false>(problem, &smem);
-    __syncthreads();
+    // A persistent cluster can start the next item while peer CTAs are still
+    // publishing this item's indices.  Synchronize the whole cluster before
+    // reusing distributed shared memory, not just each CTA independently.
+    cooperative_groups::this_cluster().sync();
   }
 }
 
@@ -162,7 +169,11 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
  */
 template <bool kPDL, int kLevel>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
-  device::enable_smem_spilling();
+  // This kernel reserves dynamic shared memory for the exact-overflow
+  // histogram. CUDA 13 forbids enable_smem_spilling together with dynamic
+  // shared memory; the profiled kernel uses 32 registers/thread without local
+  // spills, so retaining the pragma here provides no benefit.
+  extern __shared__ __align__(16) uint32_t exact_workspace[];
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
@@ -187,7 +198,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
     if (problem.seq_len <= kReg4MaxSeqLen) {
       Register4::forward<kPDLEarly>(problem, &smem);
     } else if (problem.seq_len <= cluster_threshold) {
-      Streaming::forward<kPDLEarly>(problem, &smem);
+      Streaming::forward<kPDLEarly>(problem, &smem, exact_workspace);
     } else {  // cluster path do nothing here
       problem.out = params.get_output_ptr(blockIdx.x);
     }
@@ -201,8 +212,9 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
 
-template <bool kPDL>
-CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
+template <bool kPDL, uint32_t kMinBlocksPerSM>
+__global__ __launch_bounds__(kBlockSize, kMinBlocksPerSM)
+    __cluster_dims__(1, kClusterSize, 1) void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
@@ -326,6 +338,16 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
   }
 }
 
+template <auto* f, size_t kMaxDynamicSMEM>
+void setup_topk_v2_kernel_smem_once(host::DebugInfo where = {}) {
+  [[maybe_unused]]
+  static const auto result = [] {
+    const auto fptr = std::bit_cast<const void*>(f);
+    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+  }();
+  host::RuntimeDeviceCheck(result, where);
+}
+
 struct TopKKernel {
   static void plan(  //
       const tvm::ffi::TensorView seq_lens,
@@ -364,7 +386,8 @@ struct TopKKernel {
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const bool exact_ties) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -434,23 +457,35 @@ struct TopKKernel {
         .topk = topk,
         .page_bits = page_bits,
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
+        .exact_ties = exact_ties,
     };
 
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
+    const auto launch_main_with_workspace = [&]<int kLevel>() {
+      constexpr auto kernel = topk_main_kernel<kUsePDL, kLevel>;
+      setup_topk_v2_kernel_smem_once<kernel, kExactWorkspaceBytes>();
+      LaunchKernel(batch_size, kBlockSize, device, kExactWorkspaceBytes)
+          .config({.use_pdl = kUsePDL})
+          .launch(kernel, params);
+    };
     if (use_cluster) {
       if (batch_size <= kNumPersistentClusters) {
-        LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
-            .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-            .launch(topk_small_batch_kernel<kUsePDL>, params);
+        if (batch_size <= kClustersPerOccupancyWave) {
+          LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+              .launch(topk_small_batch_kernel<kUsePDL, 1>, params);
+        } else {
+          LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+              .launch(topk_small_batch_kernel<kUsePDL, kOccupancy>, params);
+        }
       } else {
         const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
         LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
             .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
             .launch(topk_persistent_cluster_kernel<kUsePDL>, params);
-        LaunchKernel(batch_size, kBlockSize, device)
-            .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3>, params);
+        launch_main_with_workspace.template operator()<3>();
       }
     } else if (max_seq_len <= kReg2MaxSeqLen) {
       LaunchKernel(batch_size, kBlockSize, device)
@@ -461,9 +496,7 @@ struct TopKKernel {
           .config({.use_pdl = kUsePDL})
           .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1>, params);
     } else {
-      LaunchKernel(batch_size, kBlockSize, device)
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2>, params);
+      launch_main_with_workspace.template operator()<2>();
     }
   }
 };

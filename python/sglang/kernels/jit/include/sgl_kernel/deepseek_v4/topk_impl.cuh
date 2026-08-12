@@ -149,6 +149,47 @@ SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
   return __popc(__ballot_sync(mask, pred));
 }
 
+SGL_DEVICE void warp_aggregated_histogram_add(uint32_t* histogram, uint32_t bin) {
+  const uint32_t active = __activemask();
+  const uint32_t peers = __match_any_sync(active, bin);
+  const uint32_t lane = threadIdx.x & (kWarpSize - 1);
+  const uint32_t leader = __ffs(peers) - 1;
+  if (lane == leader) atomicAdd(&histogram[bin], __popc(peers));
+}
+
+SGL_DEVICE uint32_t warp_aggregated_reserve(uint32_t* counter) {
+  const uint32_t active = __activemask();
+  const uint32_t lane = threadIdx.x & (kWarpSize - 1);
+  const uint32_t leader = __ffs(active) - 1;
+  uint32_t base = 0;
+  if (lane == leader) base = atomicAdd(counter, __popc(active));
+  base = __shfl_sync(active, base, leader);
+  const uint32_t preceding = lane == 0 ? 0 : active & ((1u << lane) - 1);
+  return base + __popc(preceding);
+}
+
+template <typename F>
+SGL_DEVICE void topk_for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  constexpr uint32_t kVecSize = 4;
+  using vec_t = AlignedVector<float, kVecSize>;
+  const uint32_t tx = threadIdx.x;
+  const uint32_t num_full = seq_len / kVecSize;
+  uint32_t vi = tx;
+  vec_t next;
+  if (vi < num_full) next.load(in, vi);
+  while (vi < num_full) {
+    const auto current = next;
+    const uint32_t base = vi * kVecSize;
+    vi += blockDim.x;
+    if (vi < num_full) next.load(in, vi);
+#pragma unroll
+    for (uint32_t j = 0; j < kVecSize; ++j)
+      fn(current[j], base + j);
+  }
+  const uint32_t tail = num_full * kVecSize;
+  if (tx < seq_len - tail) fn(in[tail + tx], tail + tx);
+}
+
 struct alignas(8) TieValue {
   float value;
   uint32_t idx;
@@ -177,6 +218,7 @@ struct TopKProblem {
   uint32_t topk;
   uint32_t seq_len;
   uint32_t page_bits;
+  bool exact_ties;
 
   // Write the raw selected index; the page-table transform is applied afterwards
   // by transform_output() in a separate, pipelined pass. Keeping the per-element
@@ -208,6 +250,11 @@ struct TopKConfig {
   // by downstream sparse attention.
   static constexpr uint32_t kMaxNumTie = 2048;
   static constexpr uint32_t kRadixSize = 1 << 8;
+  static constexpr uint32_t kLargeRadixBits = 12;
+  static constexpr uint32_t kLargeRadixSize = 1 << kLargeRadixBits;
+  static constexpr uint32_t kPrecomputedRadixBits = 13;
+  static constexpr uint32_t kPrecomputedRadixSize = 1 << kPrecomputedRadixBits;
+  static constexpr uint32_t kLargeTieWorkspaceBytes = kPrecomputedRadixSize * sizeof(uint32_t);
   static constexpr uint32_t kTopKItems = (kMaxTopK + kBlockSize - 1) / kBlockSize;
   // tie candidates owned per thread in the strided handle_tie loops
   static constexpr uint32_t kTieItems = kMaxNumTie / kBlockSize;
@@ -225,6 +272,14 @@ struct TopKConfig {
     MatchBin match;
     uint32_t warp_sum[kNumWarps];
     uint32_t histogram[2][kRadixSize];
+  };
+
+  struct LargeTieSmem {
+    alignas(128) uint32_t counter;
+    alignas(128) uint32_t counter_final;
+    TieHandleSmem::MatchBin match;
+    uint32_t warp_sum[kNumWarps];
+    uint32_t histogram[kLargeRadixSize];
   };
 
   /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
@@ -413,6 +468,164 @@ struct TopKConfig {
       if (write_pos[i] < topk) problem.emit(base + write_pos[i], idx[i]);
     }
   }
+
+  /// Exact overflow path. The normal path keeps at most kMaxNumTie candidates
+  /// from the fp16-derived coarse bin; when that bin is denser, refine its fp32
+  /// ordered keys in-place and re-scan only the surviving prefix instead of
+  /// silently selecting from a truncation.
+  template <typename Smem>
+  __device__ __noinline__ static void select_large_tie(
+      const float* input,
+      uint32_t length,
+      float low,
+      float high,
+      const TopKProblem& problem,
+      uint32_t base,
+      uint32_t num_candidates,
+      Smem* smem,
+      uint32_t* precomputed_histogram = nullptr,
+      uint32_t precomputed_radix_bits = 0) {
+    static_assert(sizeof(LargeTieSmem) <= sizeof(decltype(smem->tie)));
+    auto* scratch = reinterpret_cast<LargeTieSmem*>(&smem->tie);
+    uint32_t remaining = problem.topk - base;
+    uint32_t active_count = num_candidates;
+    const uint32_t min_key = extract_exact_bin(low);
+    const uint32_t high_key = extract_exact_bin(high);
+    const uint32_t max_key = high_key - 1;
+    const uint32_t different = min_key ^ max_key;
+    uint32_t variable_bits = different == 0 ? 0 : 32 - __clz(different);
+    uint32_t prefix = variable_bits == 32 ? 0 : (min_key >> variable_bits);
+
+#pragma unroll
+    for (uint32_t round = 0; round < 3 && variable_bits > 0; ++round) {
+      const bool use_precomputed = round == 0 && precomputed_histogram != nullptr;
+      const uint32_t radix_bits = use_precomputed ? precomputed_radix_bits : kLargeRadixBits;
+      const uint32_t histogram_size = 1u << radix_bits;
+      const uint32_t bits = min(variable_bits, radix_bits);
+      const uint32_t shift = variable_bits - bits;
+      const uint32_t bin_mask = (1u << bits) - 1;
+      uint32_t* histogram = use_precomputed ? precomputed_histogram : scratch->histogram;
+#pragma unroll
+      for (uint32_t i = 0; i < kLargeRadixSize / kBlockSize; ++i) {
+        if (!use_precomputed) histogram[threadIdx.x + i * kBlockSize] = 0;
+      }
+      __syncthreads();
+      if (!use_precomputed) {
+        topk_for_each_input(input, length, [&](float value, uint32_t) {
+          const uint32_t key = extract_exact_bin(value);
+          if (value >= low && value < high && (variable_bits == 32 || (key >> variable_bits) == prefix)) {
+            warp_aggregated_histogram_add(histogram, (key >> shift) & bin_mask);
+          }
+        });
+        __syncthreads();
+      }
+
+      const uint32_t lane = threadIdx.x & (kWarpSize - 1);
+      const uint32_t warp = threadIdx.x / kWarpSize;
+      uint32_t bins[kPrecomputedRadixSize / kBlockSize];
+      uint32_t local_sum = 0;
+#pragma unroll
+      for (uint32_t i = 0; i < kPrecomputedRadixSize / kBlockSize; ++i) {
+        bins[i] = 0;
+        if (i < histogram_size / kBlockSize) {
+          bins[i] = histogram[threadIdx.x * (histogram_size / kBlockSize) + i];
+          local_sum += bins[i];
+        }
+      }
+      const uint32_t inclusive = warp_inclusive_sum(lane, local_sum);
+      const uint32_t exclusive = inclusive - local_sum;
+      if (lane == kWarpSize - 1) scratch->warp_sum[warp] = inclusive;
+      __syncthreads();
+      const uint32_t preceding = warp::reduce_sum(lane < warp ? scratch->warp_sum[lane] : 0);
+      uint32_t count_prefix = preceding + exclusive;
+#pragma unroll
+      for (uint32_t i = 0; i < kPrecomputedRadixSize / kBlockSize; ++i) {
+        if (i >= histogram_size / kBlockSize) break;
+        count_prefix += bins[i];
+        const uint32_t above = active_count - count_prefix;
+        if (above < remaining && above + bins[i] >= remaining) {
+          scratch->match = {threadIdx.x * (histogram_size / kBlockSize) + i, above, bins[i]};
+        }
+      }
+      __syncthreads();
+      remaining -= scratch->match.above_count;
+      active_count = scratch->match.equal_count;
+      prefix = (prefix << bits) | scratch->match.bin;
+      variable_bits = shift;
+
+      // The precomputed first level normally leaves only a small exact-key
+      // prefix. Cache that survivor set while emitting the already-selected
+      // upper prefixes, then finish in shared memory. This folds the remaining
+      // radix pass and final output pass into one row scan.
+      if (use_precomputed && variable_bits > 0 && active_count <= kMaxNumTie) {
+        auto* tie_scratch = &smem->tie.handle;
+        if (threadIdx.x == 0) tie_scratch->counter = tie_scratch->counter_final = 0;
+        __syncthreads();
+        const uint32_t above_prefix = problem.topk - base - remaining;
+        topk_for_each_input(input, length, [&](float value, uint32_t index) {
+          if (value < low || value >= high) return;
+          const uint32_t key = extract_exact_bin(value);
+          const uint32_t key_prefix = key >> variable_bits;
+          if (key_prefix > prefix) {
+            const uint32_t rank = warp_aggregated_reserve(&tie_scratch->counter);
+            if (rank < above_prefix) problem.emit(base + rank, index);
+          } else if (key_prefix == prefix) {
+            const uint32_t rank = warp_aggregated_reserve(&tie_scratch->counter_final);
+            if (rank < kMaxNumTie) smem->tie.values[rank] = {value, index};
+          }
+        });
+        __syncthreads();
+        handle_tie(smem->tie.values, problem, base + above_prefix, active_count, remaining, tie_scratch);
+        return;
+      }
+    }
+
+    const uint32_t above_threshold = problem.topk - base - remaining;
+    if (threadIdx.x == 0) scratch->counter = scratch->counter_final = 0;
+    __syncthreads();
+    topk_for_each_input(input, length, [&](float value, uint32_t index) {
+      if (value < low || value >= high) return;
+      const uint32_t key = extract_exact_bin(value);
+      if (key > prefix) {
+        const uint32_t rank = warp_aggregated_reserve(&scratch->counter);
+        if (rank < above_threshold) problem.emit(base + rank, index);
+      } else if (key == prefix) {
+        const uint32_t rank = warp_aggregated_reserve(&scratch->counter_final);
+        if (rank < remaining) problem.emit(base + above_threshold + rank, index);
+      }
+    });
+  }
+
+  template <typename Smem>
+  SGL_DEVICE static void finish_selection(
+      const float* input,
+      uint32_t length,
+      float low,
+      float high,
+      const TopKProblem& problem,
+      uint32_t above_count,
+      uint32_t equal_count,
+      Smem* smem,
+      uint32_t* precomputed_histogram = nullptr,
+      uint32_t precomputed_radix_bits = 0) {
+    const uint32_t remain = above_count < problem.topk ? problem.topk - above_count : 0;
+    if (remain == 0) return;
+    if (problem.exact_ties && equal_count > kMaxNumTie) {
+      select_large_tie(
+          input,
+          length,
+          low,
+          high,
+          problem,
+          above_count,
+          equal_count,
+          smem,
+          precomputed_histogram,
+          precomputed_radix_bits);
+    } else {
+      handle_tie(smem->tie.values, problem, above_count, min(equal_count, kMaxNumTie), remain, &smem->tie.handle);
+    }
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -585,6 +798,29 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto threshold_bin = smem->threshold_bin;
     const auto v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
     const auto v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const bool precompute_large_tie = problem.exact_ties && smem->histogram[threshold_bin] > kMaxNumTie;
+    // large_tie_scratch aliases the coarse histogram. Make sure every thread
+    // has consumed the threshold-bin count before any thread clears the
+    // overlay; without this barrier sm_100 can observe a partially cleared
+    // histogram and diverge on precompute_large_tie.
+    __syncthreads();
+    auto* large_tie_scratch = reinterpret_cast<LargeTieSmem*>(&smem->tie);
+    uint32_t precomputed_shift = 0;
+    uint32_t precomputed_mask = 0;
+    if (precompute_large_tie) {
+      const uint32_t min_key = extract_exact_bin(v_lo);
+      const uint32_t high_key = extract_exact_bin(v_hi);
+      const uint32_t different = min_key ^ (high_key - 1);
+      const uint32_t variable_bits = different == 0 ? 0 : 32 - __clz(different);
+      const uint32_t bits = min(variable_bits, kLargeRadixBits);
+      precomputed_shift = variable_bits - bits;
+      precomputed_mask = (1u << bits) - 1;
+#pragma unroll
+      for (uint32_t i = 0; i < kLargeRadixSize / kBlockSize; ++i) {
+        large_tie_scratch->histogram[tx + i * kBlockSize] = 0;
+      }
+      __syncthreads();
+    }
     const auto collect = [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
@@ -592,8 +828,12 @@ struct TopKRegister : TopKRadixBase<12> {
           problem.emit(pos, idx);
       } else if (val >= v_lo) {
         const auto count_eq = atomicAdd(&smem->count_eq, 1);
-        if (count_eq < kMaxNumTie) [[likely]]
+        if (!precompute_large_tie && count_eq < kMaxNumTie) [[likely]]
           smem->tie.values[count_eq] = {val, idx};
+        if (precompute_large_tie) {
+          const uint32_t bin = (extract_exact_bin(val) >> precomputed_shift) & precomputed_mask;
+          warp_aggregated_histogram_add(large_tie_scratch->histogram, bin);
+        }
       }
     };
 #pragma unroll
@@ -614,9 +854,17 @@ struct TopKRegister : TopKRadixBase<12> {
     __syncthreads();
     const auto above_count = smem->count_gt;
     const auto equal_count = smem->count_eq;
-    const auto remain_topk = above_count < topk ? topk - above_count : 0;
-    const auto tie_count = min(equal_count, kMaxNumTie);
-    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+    finish_selection(
+        problem.in,
+        problem.seq_len,
+        v_lo,
+        v_hi,
+        problem,
+        above_count,
+        equal_count,
+        smem,
+        precompute_large_tie ? large_tie_scratch->histogram : nullptr,
+        kLargeRadixBits);
   }
 };
 
@@ -629,7 +877,7 @@ struct TopKStreaming : TopKRegister<2> {
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
   template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem problem, void* _smem) {
+  SGL_DEVICE static void forward(const TopKProblem problem, void* _smem, uint32_t* large_tie_workspace = nullptr) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -664,6 +912,23 @@ struct TopKStreaming : TopKRegister<2> {
     const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
     const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
     const auto topk = problem.topk;
+    const bool precompute_large_tie =
+        problem.exact_ties && large_tie_workspace != nullptr && smem->histogram[threshold_bin] > kMaxNumTie;
+    uint32_t precomputed_shift = 0;
+    uint32_t precomputed_mask = 0;
+    if (precompute_large_tie) {
+      const uint32_t min_key = extract_exact_bin(v_lo);
+      const uint32_t high_key = extract_exact_bin(v_hi);
+      const uint32_t different = min_key ^ (high_key - 1);
+      const uint32_t variable_bits = different == 0 ? 0 : 32 - __clz(different);
+      const uint32_t bits = min(variable_bits, kPrecomputedRadixBits);
+      precomputed_shift = variable_bits - bits;
+      precomputed_mask = (1u << bits) - 1;
+      for (uint32_t i = tx; i < kPrecomputedRadixSize; i += kBlockSize) {
+        large_tie_workspace[i] = 0;
+      }
+      __syncthreads();
+    }
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
@@ -672,8 +937,12 @@ struct TopKStreaming : TopKRegister<2> {
         }
       } else if (val >= v_lo) {
         const auto count_eq = atomicAdd(&smem->count_eq, 1);
-        if (count_eq < kMaxNumTie) [[likely]] {
+        if (!precompute_large_tie && count_eq < kMaxNumTie) [[likely]] {
           smem->tie.values[count_eq] = {val, idx};
+        }
+        if (precompute_large_tie) {
+          const uint32_t bin = (extract_exact_bin(val) >> precomputed_shift) & precomputed_mask;
+          atomicAdd(&large_tie_workspace[bin], 1);
         }
       }
     });
@@ -686,9 +955,17 @@ struct TopKStreaming : TopKRegister<2> {
     __syncthreads();
     const auto above_count = smem->count_gt;
     const auto equal_count = smem->count_eq;
-    const auto remain_topk = above_count < topk ? topk - above_count : 0;
-    const auto tie_count = min(equal_count, kMaxNumTie);
-    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+    finish_selection(
+        problem.in,
+        problem.seq_len,
+        v_lo,
+        v_hi,
+        problem,
+        above_count,
+        equal_count,
+        smem,
+        precompute_large_tie ? large_tie_workspace : nullptr,
+        kPrecomputedRadixBits);
   }
 };
 
@@ -709,10 +986,121 @@ struct TopKCluster : TopKRadixBase<10> {
     int32_t tmp_out[kMaxTopK];
   };
 
-  // Process ONE batch element (one cluster). NO PDL and NO trailing barrier --
-  // the persistent kernel does PDLWaitPrimary once before its item loop and a
-  // cluster.sync() after each forward(). Writes raw indices to out; the kernel's
-  // transform pass applies the page-table transform.
+  template <typename ClusterGroup>
+  __device__ __noinline__ static void select_large_tie_cluster(
+      const TopKProblem& problem,
+      uint32_t chunk_start,
+      uint32_t local_seq_len,
+      float low,
+      float high,
+      uint32_t base,
+      uint32_t num_candidates,
+      Smem* smem,
+      const ClusterGroup& cluster,
+      bool first_histogram_precomputed) {
+    static_assert(sizeof(LargeTieSmem) <= sizeof(decltype(smem->tie)));
+    const uint32_t rank = blockIdx.y;
+    auto* local_scratch = reinterpret_cast<LargeTieSmem*>(&smem->tie);
+    auto* primary_smem = cluster.map_shared_rank(smem, 0);
+    auto* primary_scratch = reinterpret_cast<LargeTieSmem*>(&primary_smem->tie);
+    uint32_t remaining = problem.topk - base;
+    uint32_t active_count = num_candidates;
+    const uint32_t min_key = extract_exact_bin(low);
+    const uint32_t high_key = extract_exact_bin(high);
+    const uint32_t different = min_key ^ (high_key - 1);
+    uint32_t variable_bits = different == 0 ? 0 : 32 - __clz(different);
+    uint32_t prefix = variable_bits == 32 ? 0 : min_key >> variable_bits;
+
+#pragma unroll
+    for (uint32_t round = 0; round < 3 && variable_bits > 0; ++round) {
+      const bool use_precomputed = round == 0 && first_histogram_precomputed;
+      const uint32_t bits = min(variable_bits, kLargeRadixBits);
+      const uint32_t shift = variable_bits - bits;
+      const uint32_t bin_mask = (1u << bits) - 1;
+#pragma unroll
+      for (uint32_t i = 0; i < kLargeRadixSize / kBlockSize; ++i) {
+        if (!use_precomputed) local_scratch->histogram[threadIdx.x + i * kBlockSize] = 0;
+      }
+      __syncthreads();
+      if (!use_precomputed) {
+        topk_for_each_input(problem.in, local_seq_len, [&](float value, uint32_t) {
+          const uint32_t key = extract_exact_bin(value);
+          if (value >= low && value < high && (variable_bits == 32 || (key >> variable_bits) == prefix)) {
+            warp_aggregated_histogram_add(local_scratch->histogram, (key >> shift) & bin_mask);
+          }
+        });
+        __syncthreads();
+      }
+      cluster.sync();
+
+      constexpr uint32_t kBinsPerRank = kLargeRadixSize / kClusterSize;
+      if (threadIdx.x < kBinsPerRank) {
+        const uint32_t bin = rank * kBinsPerRank + threadIdx.x;
+        uint32_t total = 0;
+#pragma unroll
+        for (uint32_t peer = 0; peer < kClusterSize; ++peer) {
+          auto* peer_smem = cluster.map_shared_rank(smem, peer);
+          auto* peer_scratch = reinterpret_cast<LargeTieSmem*>(&peer_smem->tie);
+          total += peer_scratch->histogram[bin];
+        }
+        primary_scratch->histogram[bin] = total;
+      }
+      cluster.sync();
+
+      if (rank == 0) {
+        const uint32_t lane = threadIdx.x & (kWarpSize - 1);
+        const uint32_t warp = threadIdx.x / kWarpSize;
+        uint32_t bins[kLargeRadixSize / kBlockSize];
+        uint32_t local_sum = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kLargeRadixSize / kBlockSize; ++i) {
+          bins[i] = primary_scratch->histogram[threadIdx.x * (kLargeRadixSize / kBlockSize) + i];
+          local_sum += bins[i];
+        }
+        const uint32_t inclusive = warp_inclusive_sum(lane, local_sum);
+        const uint32_t exclusive = inclusive - local_sum;
+        if (lane == kWarpSize - 1) primary_scratch->warp_sum[warp] = inclusive;
+        __syncthreads();
+        const uint32_t preceding = warp::reduce_sum(lane < warp ? primary_scratch->warp_sum[lane] : 0);
+        uint32_t count_prefix = preceding + exclusive;
+#pragma unroll
+        for (uint32_t i = 0; i < kLargeRadixSize / kBlockSize; ++i) {
+          count_prefix += bins[i];
+          const uint32_t above = active_count - count_prefix;
+          if (above < remaining && above + bins[i] >= remaining) {
+            primary_scratch->match = {threadIdx.x * (kLargeRadixSize / kBlockSize) + i, above, bins[i]};
+          }
+        }
+      }
+      cluster.sync();
+      remaining -= primary_scratch->match.above_count;
+      active_count = primary_scratch->match.equal_count;
+      prefix = (prefix << bits) | primary_scratch->match.bin;
+      variable_bits = shift;
+    }
+
+    const uint32_t above_threshold = problem.topk - base - remaining;
+    if (rank == 0 && threadIdx.x == 0) {
+      primary_scratch->counter = primary_scratch->counter_final = 0;
+    }
+    cluster.sync();
+    topk_for_each_input(problem.in, local_seq_len, [&](float value, uint32_t local_idx) {
+      if (value < low || value >= high) return;
+      const uint32_t index = chunk_start + local_idx;
+      const uint32_t key = extract_exact_bin(value);
+      if (key > prefix) {
+        const uint32_t selected = warp_aggregated_reserve(&primary_scratch->counter);
+        if (selected < above_threshold) problem.emit(base + selected, index);
+      } else if (key == prefix) {
+        const uint32_t selected = warp_aggregated_reserve(&primary_scratch->counter_final);
+        if (selected < remaining) problem.emit(base + above_threshold + selected, index);
+      }
+    });
+  }
+
+  // Process one batch element per cluster. Both callers synchronize the whole
+  // cluster after this returns, ordering output consumption and shared-memory
+  // reuse without duplicating the barrier in the dense-bin overflow path.
   template <bool kUsePDL>
   SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
@@ -776,6 +1164,27 @@ struct TopKCluster : TopKRadixBase<10> {
     const auto threshold_bin = smem->threshold_bin;
     const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
     const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const bool precompute_large_tie = problem.exact_ties && smem->histogram[threshold_bin] > kMaxNumTie;
+    // The exact histogram reuses the coarse histogram's union storage. Ensure
+    // every thread has consumed the global threshold-bin count first.
+    __syncthreads();
+    uint32_t precomputed_shift = 0;
+    uint32_t precomputed_mask = 0;
+    if (precompute_large_tie) {
+      const uint32_t min_key = extract_exact_bin(v_lo);
+      const uint32_t high_key = extract_exact_bin(v_hi);
+      const uint32_t different = min_key ^ (high_key - 1);
+      const uint32_t variable_bits = different == 0 ? 0 : 32 - __clz(different);
+      const uint32_t bits = min(variable_bits, kLargeRadixBits);
+      precomputed_shift = variable_bits - bits;
+      precomputed_mask = (1u << bits) - 1;
+      auto* scratch = reinterpret_cast<LargeTieSmem*>(&smem->tie);
+#pragma unroll
+      for (uint32_t i = 0; i < kLargeRadixSize / kBlockSize; ++i) {
+        scratch->histogram[tx + i * kBlockSize] = 0;
+      }
+      __syncthreads();
+    }
 
     // Phase 3: collect candidates. The primary scatters straight into
     // `problem.out`, the others stage into block-local `smem->tmp_out`.
@@ -800,14 +1209,20 @@ struct TopKCluster : TopKRadixBase<10> {
           }
         } else if (val >= v_lo) {
           const auto count_eq = atomicAdd(&smem->count_eq, 1);
-          if (count_eq < kMaxNumTie) [[likely]] {
+          if (!precompute_large_tie && count_eq < kMaxNumTie) [[likely]] {
             smem->tie.values[count_eq] = {val, idx};
+          }
+          if (precompute_large_tie) {
+            auto* scratch = reinterpret_cast<LargeTieSmem*>(&smem->tie);
+            const uint32_t bin = (extract_exact_bin(val) >> precomputed_shift) & precomputed_mask;
+            warp_aggregated_histogram_add(scratch->histogram, bin);
           }
         }
       });
       __syncthreads();
       const auto local_above_count = smem->count_gt;
-      const auto local_equal_count = min(smem->count_eq, kMaxNumTie);
+      const auto local_equal_count = smem->count_eq;
+      const auto local_equal_copy = precompute_large_tie ? 0 : min(local_equal_count, kMaxNumTie);
       const auto smem_0 = cluster.map_shared_rank(smem, 0);
       if (tx == 0) {
         const auto gt = atomicAdd(&smem_0->count_gt, local_above_count);
@@ -821,7 +1236,7 @@ struct TopKCluster : TopKRadixBase<10> {
 #pragma unroll
       for (uint32_t i = 0; i < kTieItems; ++i) {
         const auto t = tx + i * kBlockSize;
-        if (t < local_equal_count && start_eq_local + t < kMaxNumTie) {
+        if (t < local_equal_copy && start_eq_local + t < kMaxNumTie) {
           smem_0->tie.values[start_eq_local + t] = smem->tie.values[t];
         }
       }
@@ -846,20 +1261,44 @@ struct TopKCluster : TopKRadixBase<10> {
           }
         } else if (val >= v_lo) {
           const auto count_eq = atomicAdd(&smem->count_eq, 1);
-          if (count_eq < kMaxNumTie) [[likely]] {
+          if (!precompute_large_tie && count_eq < kMaxNumTie) [[likely]] {
             smem->tie.values[count_eq] = {val, idx};
+          }
+          if (precompute_large_tie) {
+            auto* scratch = reinterpret_cast<LargeTieSmem*>(&smem->tie);
+            const uint32_t bin = (extract_exact_bin(val) >> precomputed_shift) & precomputed_mask;
+            warp_aggregated_histogram_add(scratch->histogram, bin);
           }
         }
       });
 
       cluster.sync();
 
-      // Phase 4: Handle ties.
-      const auto above_count = smem->count_gt;
-      const auto equal_count = smem->count_eq;
-      const auto remain_topk = above_count < topk ? topk - above_count : 0;
-      const auto tie_count = min(equal_count, kMaxNumTie);
-      handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+      // The primary handles the common in-buffer case below, after every rank
+      // has observed the global equal count.
+    }
+    const auto smem_0 = cluster.map_shared_rank(smem, 0);
+    const auto above_count = smem_0->count_gt;
+    const auto equal_count = smem_0->count_eq;
+    const auto remain_topk = above_count < topk ? topk - above_count : 0;
+    if (remain_topk > 0 && problem.exact_ties && equal_count > kMaxNumTie) {
+      select_large_tie_cluster(
+          problem,
+          chunk_start,
+          local_seq_len,
+          v_lo,
+          v_hi,
+          above_count,
+          equal_count,
+          smem,
+          cluster,
+          precompute_large_tie);
+    } else if (is_primary && remain_topk > 0) {
+      // The branch-local cluster.sync() above already publishes the aggregated
+      // counts and tie buffer. Non-primary ranks can emit their disjoint
+      // strictly-above ranges while the primary resolves ties. A later cluster
+      // synchronization (or kernel completion) orders output consumption.
+      handle_tie(smem->tie.values, problem, above_count, min(equal_count, kMaxNumTie), remain_topk, &smem->tie.handle);
     }
   }
 };
